@@ -1,0 +1,517 @@
+name: Deploy Onix Service
+
+on:
+  workflow_dispatch:
+#   push:
+#     paths:
+#       - "api-service/**"
+#     branches:
+#       - "draft-*"
+#       - "release-*"
+
+env:
+  REGISTRY: ghcr.io
+  REGISTRY_NAMESPACE: ondc-official
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    outputs:
+      image_name: ${{ steps.meta.outputs.image_name }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      build_tag: ${{ steps.meta.outputs.build_tag }}
+      build_type: ${{ steps.detect-env.outputs.build_type }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect build environment
+        id: detect-env
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == draft-* ]]; then
+            echo "build_type=draft" >> $GITHUB_OUTPUT
+            echo "environment=development" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF_NAME}" == release-* ]]; then
+            echo "build_type=release" >> $GITHUB_OUTPUT
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          else
+            echo "build_type=default" >> $GITHUB_OUTPUT
+            echo "environment=production" >> $GITHUB_OUTPUT
+          fi
+          echo "✅ Detected environment: ${{ github.ref_name }} (type: $(cat $GITHUB_OUTPUT | grep build_type | cut -d= -f2))"
+
+      - name: Clone and prepare generator repo
+        id: prepare
+        run: |
+          set -e
+
+          echo "📦 Cloning generator repository..."
+          git clone --single-branch --branch main --depth 1 \
+            https://github.com/ONDC-Official/automation-api-service-generator.git generator
+
+          cd generator
+          GENERATOR_SHA=$(git rev-parse HEAD)
+
+          echo "📋 Copying api-config from source repo..."
+          cp -rf $GITHUB_WORKSPACE/api-service/src/config/* ./src/config/
+
+          echo "📦 Installing dependencies..."
+          npm ci --prefer-offline --no-audit
+
+          echo "GENERATOR_SHA=${GENERATOR_SHA}" >> $GITHUB_OUTPUT
+          echo "✅ Generator prepared (SHA: ${GENERATOR_SHA:0:8})"
+
+      - name: Generate environment file from template
+        run: |
+          BUILD_TYPE="${{ steps.detect-env.outputs.build_type }}"
+          TEMPLATE_FILE=".github/workflows/env-templates/${BUILD_TYPE}.env"
+
+          if [ ! -f "$TEMPLATE_FILE" ]; then
+            echo "❌ Template file not found: $TEMPLATE_FILE"
+            exit 1
+          fi
+
+          echo "📝 Using environment template: $TEMPLATE_FILE"
+          cp "$TEMPLATE_FILE" ./generator/.env
+          echo "✅ Environment file created"
+
+      - name: Build and generate output
+        working-directory: generator
+        run: |
+          set -e
+
+          echo "🔨 Running build process..."
+          npm run build
+
+          echo "⚙️  Generating build output..."
+          npm start
+
+          echo "✅ Build output generated successfully"
+          if [ -d "build-output" ]; then
+            echo "📂 Build output directory contents:"
+            ls -la build-output/
+          fi
+
+      - name: Clone Onix repository
+        working-directory: generator
+        run: |
+          set -e
+
+          echo "📦 Cloning automation-beckn-onix repository..."
+          git clone --single-branch --branch main --depth 1 \
+            https://github.com/ONDC-Official/automation-beckn-onix automation-beckn-onix
+
+          BECKN_ONIX_SHA=$(git -C ./automation-beckn-onix rev-parse HEAD)
+          echo "BECKN_ONIX_SHA=${BECKN_ONIX_SHA}" >> $GITHUB_ENV
+          echo "✅ Onix repository cloned (SHA: ${BECKN_ONIX_SHA:0:8})"
+
+      - name: Calculate build metadata
+        id: meta
+        working-directory: generator
+        run: |
+          set -e
+
+          # Collect all SHAs
+          CONFIG_SHA="${GITHUB_SHA}"
+          GENERATOR_SHA="${{ steps.prepare.outputs.GENERATOR_SHA }}"
+
+          # Get plugin SHA if exists
+          if [ -d "./build-output/temp/automation-beckn-plugins" ]; then
+            PLUGIN_SHA=$(git -C ./build-output/temp/automation-beckn-plugins rev-parse HEAD 2>/dev/null || echo "none")
+          else
+            PLUGIN_SHA="none"
+          fi
+
+          ONIX_SHA="${BECKN_ONIX_SHA}"
+
+          # Create composite tag
+          BUILD_TAG="${CONFIG_SHA:0:8}-${GENERATOR_SHA:0:8}-${PLUGIN_SHA:0:8}-${ONIX_SHA:0:8}"
+
+          # Generate deterministic hash
+          TAG_HASH=$(echo -n "$BUILD_TAG" | sha256sum | awk '{print substr($1,1,16)}')
+
+          # Construct image name
+          IMAGE_NAME="${{ env.REGISTRY }}/${{ env.REGISTRY_NAMESPACE }}/automation-api-service-${{ vars.CONTAINER_NAME }}"
+
+          # Set outputs
+          echo "build_tag=${BUILD_TAG}" >> $GITHUB_OUTPUT
+          echo "tag_hash=${TAG_HASH}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${BUILD_TAG}" >> $GITHUB_OUTPUT
+
+          # Display metadata
+          echo "📊 Build Metadata:"
+          echo "  📝 Config SHA:    ${CONFIG_SHA:0:8}"
+          echo "  🔧 Generator SHA: ${GENERATOR_SHA:0:8}"
+          echo "  🔌 Plugin SHA:    ${PLUGIN_SHA:0:8}"
+          echo "  📦 Onix SHA:      ${ONIX_SHA:0:8}"
+          echo "  🏷️  Build tag:     ${BUILD_TAG}"
+          echo "  #️⃣  Tag hash:      ${TAG_HASH}"
+          echo "  🐳 Image:         ${IMAGE_NAME}:${BUILD_TAG}"
+
+      - name: Create Dockerfile
+        working-directory: generator
+        run: |
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM node:18-alpine AS base
+
+          WORKDIR /app
+
+          # Copy generated build output
+          COPY build-output ./build-output
+          COPY automation-beckn-onix ./automation-beckn-onix
+          COPY .env .env
+          COPY package*.json ./
+
+          # Install production dependencies only
+          RUN npm ci --only=production --prefer-offline --no-audit
+
+          # Expose application port
+          EXPOSE ${PORT:-3000}
+
+          # Health check configuration
+          HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+            CMD node -e "require('http').get('http://localhost:${PORT:-3000}/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+
+          # Start application
+          CMD ["npm", "run", "start:prod"]
+          DOCKERFILE
+
+          echo "✅ Dockerfile created"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./generator
+          file: ./generator/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.image_name }}:${{ steps.meta.outputs.tag_hash }}
+            ${{ steps.meta.outputs.image_name }}:latest
+            ${{ steps.meta.outputs.image_name }}:stable
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.build_tag }}
+
+      - name: Generate build summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## 🚀 Build Complete
+
+          **Environment:** \`${{ steps.detect-env.outputs.environment }}\`
+          **Branch:** \`${{ github.ref_name }}\`
+          **Image:** \`${{ steps.meta.outputs.image_name }}\`
+
+          ### 📊 Build Metadata
+          | Component | SHA |
+          |-----------|-----|
+          | Config | \`${GITHUB_SHA:0:8}\` |
+          | Generator | \`${{ steps.prepare.outputs.GENERATOR_SHA }}:0:8}\` |
+          | Onix | \`${BECKN_ONIX_SHA:0:8}\` |
+
+          ### 🏷️ Available Tags
+          - \`${{ steps.meta.outputs.image_tag }}\` (full version)
+          - \`${{ steps.meta.outputs.tag_hash }}\` (hash)
+          - \`latest\` (latest build)
+          - \`stable\` (deployment tag)
+
+          ### 📦 Image Details
+          \`\`\`
+          ${{ steps.meta.outputs.image_name }}:stable
+          \`\`\`
+          EOF
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare environment file for deployment
+        id: prepare-env
+        run: |
+          BUILD_TYPE="${{ needs.build-and-push.outputs.build_type }}"
+          TEMPLATE_FILE=".github/workflows/env-templates/${BUILD_TYPE}.env"
+
+          if [ ! -f "$TEMPLATE_FILE" ]; then
+            echo "❌ Template file not found: $TEMPLATE_FILE"
+            exit 1
+          fi
+
+          echo "📝 Reading environment template: $TEMPLATE_FILE"
+
+          # Read the template file and encode it for transfer
+          ENV_CONTENT=$(cat "$TEMPLATE_FILE")
+
+          # Save to a file that will be transferred
+          echo "$ENV_CONTENT" > .env.deploy
+
+          echo "✅ Environment file prepared for deployment"
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 10m
+          script: |
+            set -e
+
+            # Configuration
+            BUILD_TYPE="${{ needs.build-and-push.outputs.build_type }}"
+            IMAGE_NAME="${{ needs.build-and-push.outputs.image_name }}"
+            BUILD_TAG="${{ needs.build-and-push.outputs.build_tag }}"
+            CONTAINER_NAME="automation-api-service-${{ vars.CONTAINER_NAME }}"
+            REPO_DIR="$HOME/ONDC-automation-framework/api-service/${CONTAINER_NAME}"
+
+            echo "================================================"
+            echo "🚀 Starting Deployment"
+            echo "================================================"
+            echo "Build type:  ${BUILD_TYPE}"
+            echo "Image:       ${IMAGE_NAME}:stable"
+            echo "Build tag:   ${BUILD_TAG}"
+            echo "Container:   ${CONTAINER_NAME}"
+            echo "Deploy dir:  ${REPO_DIR}"
+            echo "================================================"
+
+            # Prepare deployment directory
+            mkdir -p ${REPO_DIR}
+            cd ${REPO_DIR}
+
+            # Generate environment file from template
+            if [[ "$BUILD_TYPE" == "draft" ]]; then
+              cat > .env <<'EOF'
+            NODE_ENV=${{ vars.NODE_ENV }}
+            SIGN_PRIVATE_KEY=${{ secrets.SIGN_PRIVATE_KEY }}
+            PORT=${{ vars.API_SERVICE_PORT }}
+            SIGN_PUBLIC_KEY=${{ vars.SIGN_PUBLIC_KEY }}
+            SUBSCRIBER_ID=${{ vars.SUBSCRIBER_ID }}
+            UKID=${{ vars.UKID }}
+            ONDC_ENV=${{ vars.ONDC_ENV }}
+            REDIS_USERNAME=${{ vars.REDIS_USERNAME }}
+            REDIS_HOST=${{ vars.REDIS_HOST }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            REDIS_PORT=${{ vars.REDIS_PORT }}
+            WORKBENCH_SUBSCRIBER_ID=${{ vars.WORKBENCH_SUBSCRIBER_ID }}
+            IN_HOUSE_REGISTRY=${{ vars.IN_HOUSE_REGISTRY }}
+            MOCK_SERVER_URL=${{ vars.MOCK_SERVER_URL }}
+            DATA_BASE_URL=${{ vars.DATA_BASE_URL }}
+            API_SERVICE_URL=${{ vars.API_SERVICE_URL }}
+            CONFIG_SERVICE_URL=${{ vars.CONFIG_SERVICE_URL }}
+            CONTAINER_NAME=${{ vars.CONTAINER_NAME }}
+            DOMAIN=${{ vars.DOMAIN }}
+            VERSION=${{ vars.VERSION }}
+            SERVICE_NAME=automation-api-service-${{ vars.CONTAINER_NAME }}
+            TRACE_URL=${{ vars.TRACE_URL }}
+            API_SERVICE_KEY=${{ secrets.API_SERVICE_KEY_DEV }}
+            LOKI_HOST=${{ vars.LOKI_HOST }}
+            HOSTED_ENV=${{ vars.HOSTED_ENV_DEV }}
+            NO_URL=${{ vars.NO_URL }}
+            NO_TOKEN=${{ secrets.NO_TOKEN }}
+            IS_ONIX_ENABLED=${{ vars.IS_ONIX_ENABLED }}
+            RECORDER_SERVICE_GRPC_URL=${{ vars.RECORDER_SERVICE_GRPC_URL }}
+            RECORDER_SERVICE_HTTP_URL=${{ vars.RECORDER_SERVICE_HTTP_URL }}
+            EOF
+
+            elif [[ "$BUILD_TYPE" == "release" ]]; then
+              cat > .env <<'EOF'
+            NODE_ENV=${{ vars.NODE_ENV }}
+            SIGN_PRIVATE_KEY=${{ secrets.SIGN_PRIVATE_KEY }}
+            PORT=${{ vars.API_SERVICE_PORT }}
+            SIGN_PUBLIC_KEY=${{ vars.SIGN_PUBLIC_KEY }}
+            SUBSCRIBER_ID=${{ vars.SUBSCRIBER_ID_STAGING }}
+            UKID=${{ vars.UKID_STAGING }}
+            ONDC_ENV=${{ vars.ONDC_ENV }}
+            REDIS_USERNAME=${{ vars.REDIS_USERNAME }}
+            REDIS_HOST=${{ vars.REDIS_HOST }}
+            REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+            REDIS_PORT=${{ vars.REDIS_PORT_STAGING }}
+            MOCK_SERVER_URL=${{ vars.MOCK_SERVER_URL_STAGING }}
+            DATA_BASE_URL=${{ vars.DATA_BASE_URL_STAGING }}
+            API_SERVICE_URL=${{ vars.API_SERVICE_URL_STAGING }}
+            CONTAINER_NAME=${{ vars.CONTAINER_NAME }}
+            CONFIG_SERVICE_URL=${{ vars.CONFIG_SERVICE_URL_STAGING }}
+            DOMAIN=${{ vars.DOMAIN }}
+            VERSION=${{ vars.VERSION }}
+            SERVICE_NAME=automation-api-service-${{ vars.CONTAINER_NAME }}
+            TRACE_URL=${{ vars.TRACE_URL_STAGING }}
+            API_SERVICE_KEY=${{ secrets.API_SERVICE_KEY_STAGING }}
+            LOKI_HOST=${{ vars.LOKI_HOST }}
+            WORKBENCH_SUBSCRIBER_ID=${{ vars.WORKBENCH_SUBSCRIBER_ID_STAGING }}
+            IN_HOUSE_REGISTRY=${{ vars.IN_HOUSE_REGISTRY_STAGING }}
+            HOSTED_ENV=${{ vars.HOSTED_ENV_STAGING }}
+            NO_URL=${{ vars.NO_URL }}
+            NO_TOKEN=${{ secrets.NO_TOKEN }}
+            IS_ONIX_ENABLED=${{ vars.IS_ONIX_ENABLED }}
+            RECORDER_SERVICE_GRPC_URL=${{ vars.RECORDER_SERVICE_GRPC_URL_STAGING }}
+            RECORDER_SERVICE_HTTP_URL=${{ vars.RECORDER_SERVICE_HTTP_URL_STAGING }}
+            EOF
+            fi
+
+            echo "✅ Environment file created"
+
+            # Backup current container for rollback
+            OLD_CONTAINER_ID=$(docker ps -q -f name=${CONTAINER_NAME} 2>/dev/null || echo "")
+
+            if [ -n "$OLD_CONTAINER_ID" ]; then
+              echo "📦 Found existing container: ${OLD_CONTAINER_ID:0:12}"
+              OLD_IMAGE=$(docker inspect --format='{{.Image}}' ${OLD_CONTAINER_ID})
+              echo "OLD_IMAGE=${OLD_IMAGE}" > ${REPO_DIR}/.rollback
+              echo "💾 Rollback data saved"
+            else
+              echo "ℹ️  No existing container found"
+            fi
+
+            # Pull new image
+            echo "📥 Pulling new image..."
+            docker pull ${IMAGE_NAME}:stable
+
+            # Stop and remove old container
+            if [ -n "$OLD_CONTAINER_ID" ]; then
+              echo "🛑 Stopping old container..."
+              docker stop ${CONTAINER_NAME} 2>/dev/null || true
+              docker rm ${CONTAINER_NAME} 2>/dev/null || true
+            fi
+
+            # Start new container
+            echo "🚀 Starting new container..."
+            docker run -d \
+              --name ${CONTAINER_NAME} \
+              --restart unless-stopped \
+              --env-file ${REPO_DIR}/.env \
+              -p ${{ vars.API_SERVICE_PORT }}:${{ vars.API_SERVICE_PORT }} \
+              --health-cmd="wget --no-verbose --tries=1 --spider http://localhost:${{ vars.API_SERVICE_PORT }}/health || exit 1" \
+              --health-interval=30s \
+              --health-timeout=10s \
+              --health-retries=3 \
+              --health-start-period=40s \
+              ${IMAGE_NAME}:stable
+
+            # Wait for container to be healthy
+            echo "⏳ Waiting for container to be healthy..."
+            ROLLBACK_PERFORMED=false
+
+            for i in {1..30}; do
+              HEALTH_STATUS=$(docker inspect --format='{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "starting")
+              
+              if [ "$HEALTH_STATUS" = "healthy" ]; then
+                echo "✅ Container is healthy!"
+                break
+              elif [ "$HEALTH_STATUS" = "unhealthy" ]; then
+                echo "❌ Container is unhealthy!"
+                echo "📋 Container logs (last 50 lines):"
+                docker logs --tail 50 ${CONTAINER_NAME}
+                
+                # Attempt rollback
+                if [ -f "${REPO_DIR}/.rollback" ]; then
+                  source ${REPO_DIR}/.rollback
+                  echo "🔄 Rolling back to previous image: ${OLD_IMAGE:0:12}"
+                  
+                  docker stop ${CONTAINER_NAME} 2>/dev/null || true
+                  docker rm ${CONTAINER_NAME} 2>/dev/null || true
+                  
+                  docker run -d \
+                    --name ${CONTAINER_NAME} \
+                    --restart unless-stopped \
+                    --env-file ${REPO_DIR}/.env \
+                    -p ${{ vars.API_SERVICE_PORT }}:${{ vars.API_SERVICE_PORT }} \
+                    ${OLD_IMAGE}
+                  
+                  ROLLBACK_PERFORMED=true
+                  echo "✅ Rollback completed"
+                fi
+                
+                exit 1
+              fi
+              
+              echo "  Health status: ${HEALTH_STATUS} (attempt $i/30)"
+              sleep 2
+            done
+
+            # Final verification
+            if ! docker ps | grep -q ${CONTAINER_NAME}; then
+              echo "❌ Container is not running!"
+              docker logs --tail 50 ${CONTAINER_NAME}
+              exit 1
+            fi
+
+            # Cleanup old images (keep last 3)
+            echo "🧹 Cleaning up old images..."
+            docker images ${IMAGE_NAME} --format "{{.ID}}" | tail -n +4 | xargs -r docker rmi -f 2>/dev/null || true
+
+            echo "================================================"
+            echo "✅ Deployment Successful!"
+            echo "================================================"
+            echo "Container:   ${CONTAINER_NAME}"
+            echo "Image:       ${IMAGE_NAME}:stable"
+            echo "Build tag:   ${BUILD_TAG}"
+            echo "Port:        ${{ vars.API_SERVICE_PORT }}"
+            echo "================================================"
+
+            # Display container status
+            echo ""
+            echo "📊 Container Status:"
+            docker ps -f name=${CONTAINER_NAME} --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+      - name: Generate deployment summary
+        if: success()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## ✅ Deployment Successful
+
+          **Environment:** \`${{ github.ref_name }}\`
+          **Container:** \`automation-api-service-${{ vars.CONTAINER_NAME }}\`
+          **Image:** \`${{ needs.build-and-push.outputs.image_name }}:stable\`
+          **Build Tag:** \`${{ needs.build-and-push.outputs.build_tag }}\`
+
+          ### 🌐 Service Details
+          - **Port:** \`${{ vars.API_SERVICE_PORT }}\`
+          - **Status:** Running and healthy
+          - **Restart Policy:** unless-stopped
+
+          ### 🔗 Quick Links
+          - Health Check: \`http://<server>:${{ vars.API_SERVICE_PORT }}/health\`
+          EOF
+
+      - name: Generate failure summary
+        if: failure()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## ❌ Deployment Failed
+
+          **Environment:** \`${{ github.ref_name }}\`
+          **Container:** \`automation-api-service-${{ vars.CONTAINER_NAME }}\`
+
+          The deployment failed. Please check the workflow logs for details.
+
+          ### 🔄 Rollback Status
+          If a previous version existed, the system attempted to rollback automatically.
+
+          ### 🔍 Troubleshooting
+          1. Check the container logs on the server
+          2. Verify environment variables
+          3. Check image build logs in the build-and-push job
+          4. Verify network connectivity and port availability
+          EOF
